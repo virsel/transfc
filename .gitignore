@@ -1,0 +1,5 @@
+data_input
+__pycache__
+lightning_logs
+.idea
+output
