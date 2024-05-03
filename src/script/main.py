@@ -5,7 +5,8 @@ import pandas as pd
 from data import get_train_test_split
 from config import get_default_config
 import lightning as L
-from custom_logging import set_logging
+from custom_logging import set_logging, Logger
+
 set_logging()
 import torch
 import numpy as np
@@ -40,20 +41,21 @@ if __name__ == '__main__':
 
     df = get_data()
     Xtr, Xval, Ytr, Yval = get_train_test_split(
-        df["text"], df["label"], context_length=cfg.context_length, test_size=0.2, random_state=seed_value
+        df["text"], df["label"], context_length=cfg.hyper_params.context_length, test_size=0.2, random_state=seed_value
     )
 
     train_dataset = TensorDataset(Xtr, Ytr)
     val_dataset = TensorDataset(Xval, Yval)
 
-    train_loader = DataLoader(train_dataset, batch_size=cfg.batch_size, shuffle=True, num_workers=2, persistent_workers=True)
-    val_loader = DataLoader(val_dataset, batch_size=cfg.batch_size, shuffle=False, num_workers=2, persistent_workers=True)
+    train_loader = DataLoader(train_dataset, batch_size=cfg.hyper_params.batch_size, shuffle=True, num_workers=2, persistent_workers=True)
+    val_loader = DataLoader(val_dataset, batch_size=cfg.hyper_params.batch_size, shuffle=False, num_workers=2, persistent_workers=True)
     
-    model = get_model(cfg)
-    
+    model = get_model(cfg.hyper_params)
+    logger = Logger(model)
+
     # train with pytorch lightning
-    trainer = get_trainer(cfg)
-    trainer.fit(model, train_loader, val_loader, ckpt_path=cfg.ckpt_path)
+    trainer = get_trainer(cfg, logger=logger)
+    trainer.fit(model, train_loader, ckpt_path=cfg.ckpt_path)
 
     # save the model
     # torch.save(model.state_dict(), "../output/model.pth")

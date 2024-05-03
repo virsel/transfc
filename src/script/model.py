@@ -2,172 +2,199 @@ import lightning as L
 
 import torch.nn as nn
 import torch
+import torch.nn.functional as F
 
-from config import Config
+from config import Config, HyperParams
 
 
-def get_model(cfg):
-    model = WaveModel(cfg)
-    layers = list(model.modules())[1:]
-    for layer in layers[:-1]:
-        layer.register_forward_hook(forward_hook)
-        # print(layer)
-    return  model
-    
-# Define the forward hook function
-def forward_hook(module, input, output):
-    module.out = output  # Store output in the module itself
+def get_model(params: HyperParams):
+    return TransfEncModel(params)
 
-class FlattenConsecutive(nn.Module):
-    def __init__(self, n):
+def get_trainable_layers(parent_module, parent_name='root'):
+    res = {}
+    modules = list(parent_module.named_children())
+    if len(modules) == 0 and any(param.requires_grad for param in parent_module.parameters()):
+        # Base case: If no children and has trainable params, return itself
+        res[parent_name] = parent_module
+    else:
+        for name, module in modules:
+            # Construct the full module name by appending current name to parent's
+            full_name = f'{parent_name}.{name}' if parent_name else name
+            # Recursively get trainable layers
+            sub_layers = get_trainable_layers(module, full_name)
+            if len(sub_layers) == 0 and any(param.requires_grad for param in module.parameters()):
+                # If the module has parameters but no sub-layers returned, add the module
+                res[full_name] = module
+            res.update(sub_layers)
+    return res
+
+def get_activations(parent_module, parent_name='root'):
+    res = {}
+    modules = list(parent_module.named_children())
+    if len(modules) == 0 and isinstance(parent_module, (nn.ReLU, nn.Sigmoid, nn.Tanh)):
+        # Base case: If no children and has trainable params, return itself
+        res[parent_name] = parent_module
+    else:
+        for name, module in modules:
+            # Construct the full module name by appending current name to parent's
+            full_name = f'{parent_name}.{name}' if parent_name else name
+            # Recursively get trainable layers
+            sub_layers = get_activations(module, full_name)
+            if len(sub_layers) == 0 and isinstance(module, (nn.ReLU, nn.Sigmoid, nn.Tanh)):
+                # If the module has parameters but no sub-layers returned, add the module
+                res[full_name] = module
+            res.update(sub_layers)
+    return res
+
+class Head(nn.Module):
+    """ one head of self-attention """
+
+    def __init__(self, params: HyperParams):
         super().__init__()
-        self.n = n
+        self.key = nn.Linear(params.n_embd, params.n_embd // params.n_head, bias=False)
+        self.query = nn.Linear(params.n_embd, params.n_embd // params.n_head, bias=False)
+        self.value = nn.Linear(params.n_embd, params.n_embd // params.n_head, bias=False)
+        self.register_buffer('tril', torch.tril(torch.ones(params.context_length, params.context_length)))
+        self.dropout = nn.Dropout(params.dropout)
 
     def forward(self, x):
-        # forward to torch batchnorm, expects:
-        # Input: (N,C) or (N,C,L), where N is the batch size,
-        # C is the number of features or channels, and L is the sequence length
-        # output: (N, C, L)
+        B, T, C = x.shape
+        k = self.key(x)  # (B,T,C)
+        q = self.query(x)  # (B,T,C)
+        # compute attention scores ("affinities")
+        wei = q @ k.transpose(-2, -1) * C ** -0.5  # (B, T, C) @ (B, C, T) -> (B, T, T)
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))  # (B, T, T)
+        wei = F.softmax(wei, dim=-1)  # (B, T, T)
+        wei = self.dropout(wei)
+        # perform the weighted aggregation of the values
+        v = self.value(x)  # (B,T,C)
+        out = wei @ v  # (B, T, T) @ (B, T, C) -> (B, T, C)
+        return out
 
-        N, L, C = x.shape
-        try:
-            x = x.view(N, L // self.n, C * self.n)
-        except Exception as e:
-            print(f"Error: {e}")
-            print(f"Input shape: {x.shape}")
-            print(f"Output shape: {N, L//self.n, C*self.n}")
-        if x.shape[1] == 1:
-            x = x.squeeze(1)
-        self.out = x
-        return self.out
+class MultiHeadAttention(nn.Module):
+    """ multiple heads of self-attention in parallel """
 
-
-class BatchNorm1d(nn.Module):
-    def __init__(self, dim, eps=1e-5, momentum=0.1):
+    def __init__(self, params: HyperParams):
         super().__init__()
-        self.eps = eps
-        self.momentum = momentum
-        self.training = True
-        # parameters (trained with backprop)
-        self.gamma = torch.ones(dim)
-        self.beta = torch.zeros(dim)
-        # buffers (trained with a running 'momentum update')
-        self.running_mean = torch.zeros(dim)
-        self.running_var = torch.ones(dim)
-
-    def forward(self, x, target=None):
-        # calculate the forward pass
-        if self.training:
-            if x.ndim == 2:
-                dim = 0
-            elif x.ndim == 3:
-                dim = (0, 1)
-            xmean = x.mean(dim, keepdim=True)  # batch mean
-            xvar = x.var(dim, keepdim=True)  # batch variance
-        else:
-            xmean = self.running_mean
-            xvar = self.running_var
-        xhat = (x - xmean) / torch.sqrt(xvar + self.eps)  # normalize to unit variance
-        self.out = self.gamma * xhat + self.beta
-        # update the buffers
-        if self.training:
-            with torch.no_grad():
-                self.running_mean = (
-                    1 - self.momentum
-                ) * self.running_mean + self.momentum * xmean
-                self.running_var = (
-                    1 - self.momentum
-                ) * self.running_var + self.momentum * xvar
-        return self.out
-
-    def _parameters(self):
-        return [self.gamma, self.beta]
-
-
-class WaveModel(L.LightningModule):
-    def __init__(self, cfg: Config, n_classes=5):
-        super().__init__()
-
-        # Define the layers
-        self.n_hidden = cfg.n_hidden
-        self.embedding = nn.Embedding(cfg.vocab_size, cfg.n_embd)
-        self.embedding.weight.data = (
-            self.embedding.weight.data / (cfg.n_embd * cfg.n_consecutive) ** 0.5
-        )
-        self.flatten1 = FlattenConsecutive(cfg.n_consecutive)
-        self.linear1 = nn.Linear(cfg.n_embd * cfg.n_consecutive, cfg.n_hidden, bias=False)
-        self.linear1.weight.data = (
-            self.linear1.weight.data * 5 / 3 / (cfg.n_hidden * cfg.n_consecutive) ** 0.5
-        )
-        self.batch_norm1 = BatchNorm1d(cfg.n_hidden)
-        self.tanh1 = nn.Tanh()
-
-        self.flatten2 = FlattenConsecutive(cfg.n_consecutive)
-        self.linear2 = nn.Linear(cfg.n_hidden * cfg.n_consecutive, cfg.n_hidden, bias=False)
-        self.linear2.weight.data = (
-            self.linear2.weight.data * 5 / 3 / (cfg.n_hidden * cfg.n_consecutive) ** 0.5
-        )
-        self.batch_norm2 = BatchNorm1d(cfg.n_hidden)
-        self.tanh2 = nn.Tanh()
-
-        n_consecutive = 2
-        self.flatten3 = FlattenConsecutive(n_consecutive)
-        self.linear3 = nn.Linear(cfg.n_hidden * n_consecutive, cfg.n_hidden, bias=False)
-        self.linear3.weight.data = self.linear3.weight.data * 5 / 3 / (cfg.n_hidden) ** 0.5
-        self.batch_norm3 = BatchNorm1d(cfg.n_hidden)
-        self.tanh3 = nn.Tanh()
-
-        self.output_linear = nn.Linear(cfg.n_hidden, n_classes)
-        self.output_linear.weight.data = self.output_linear.weight.data * 0.1
+        self.heads = nn.ModuleList([Head(params) for _ in range(params.n_head)])
+        self.proj = nn.Linear(params.n_embd, params.n_embd)
+        self.dropout = nn.Dropout(params.dropout)
 
     def forward(self, x):
-        # Step 1: Embedding layer
-        x = self.embedding(x)
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.dropout(self.proj(out))
+        return out
 
-        # Step 2: First flattening, linear, batch normalization, and activation layers
-        x = self.flatten1(x)
-        x = self.linear1(x)
-        x = self.batch_norm1(x)
-        x = self.tanh1(x)
+class FeedFoward(nn.Module):
+    """ a simple linear layer followed by a non-linearity """
 
-        # Step 3: Second flattening, linear, batch normalization, and activation layers
-        x = self.flatten2(x)
-        x = self.linear2(x)
-        x = self.batch_norm2(x)
-        x = self.tanh2(x)
+    def __init__(self, n_embd, dropout=0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),
+            nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout),
+        )
 
-        # Step 4: Third flattening, linear, batch normalization, and activation layers
-        x = self.flatten3(x)
-        x = self.linear3(x)
-        x = self.batch_norm3(x)
-        x = self.tanh3(x)
+    def forward(self, x):
+        return self.net(x)
 
-        # Step 5: Output linear layer
-        x = self.output_linear(x)
+class Block(nn.Module):
+    """ Transformer block: communication followed by computation """
 
+    def __init__(self, params: HyperParams):
+        # n_embd: embedding dimension, n_head: the number of heads we'd like
+        super().__init__()
+        self.sa = MultiHeadAttention(params)
+        self.ffwd = FeedFoward(params.n_embd)
+        self.ln1 = nn.LayerNorm(params.n_embd)
+        self.ln2 = nn.LayerNorm(params.n_embd)
+
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
         return x
 
-    def training_step(self, batch, batch_idx):
-        inputs, target = batch
-        output = self(inputs)
-        loss = torch.nn.functional.cross_entropy(output, target.view(-1))
-        # lossi.append(loss.log10().item())
-        # with torch.no_grad():
-        # lr = optimizer.param_groups[0]['lr']
-        # ud.append([((lr*p.grad).std() / p.output.std()).log10().item() for p in model.parameters()])
-        # logs metrics for each training_step,
-        # and the average across the epoch, to the progress bar and logger
-        self.log(
-            "train_loss", loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True
-        )
-        return loss
+class TransfEncModel(L.LightningModule):
+    def __init__(self, params: HyperParams, n_classes=5):
+        super().__init__()
+        # Important: This property activates manual optimization.
+        self.automatic_optimization = False
+        self.lossi = []
+
+        # each token directly reads off the logits for the next token from a lookup table
+        self.token_embedding_table = nn.Embedding(params.vocab_size, params.n_embd)
+        self.position_embedding_table = nn.Embedding(params.context_length, params.n_embd)
+        self.blocks = nn.Sequential(*[Block(params) for _ in range(1)])
+        self.ln_f = nn.LayerNorm(params.n_embd)  # final layer norm
+        self.lm_head = nn.Linear(params.context_length * params.n_embd, n_classes)
+
+        # register forward hook
+        self._register_forward_hooks()
+
+    def _register_forward_hooks(self):
+        # Define the forward hook function
+        activations = self.get_activations().values()
+        for act in activations:
+            act.register_forward_hook(forward_hook)
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=0.001, weight_decay=0.01)
+
+    def forward(self, idx):
+        B, T = idx.shape
+
+        # idx and targets are both (B,T) tensor of integers
+        tok_emb = self.token_embedding_table(idx)  # (B,T,C)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=self.device))  # (T,C)
+        x = tok_emb + pos_emb  # (B,T,C)
+        x = self.blocks(x)  # (B,T,C)
+        x = self.ln_f(x)  # (B,T,C)
+        B, T, C = x.shape
+        x = x.view(B, T * C)  # (B,T,C) -> (B, T*C)
+        logits = self.lm_head(x)  # (B,n_classes)
+
+        return logits
+
+    def training_step(self, batch, batch_idx):
+        inputs, target = batch
+        opt = self.optimizers()
+        opt.zero_grad()
+        output = self(inputs)
+        loss = torch.nn.functional.cross_entropy(output, target.view(-1))
+        # Call backward with retain_graph=True
+        self.manual_backward(loss, retain_graph=True)
+        # Ensure that logger has the log_ud method
+        self.training_step_log()
+        opt.step()
+        self.log(
+            "train_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True
+        )
+        return loss
+
+    def training_step_log(self):
+        if hasattr(self.logger, 'log_ud'):
+            self.logger.log_ud()
+        if hasattr(self.logger, 'log_activation_out'):
+            self.logger.log_activation_out()
+
+    def on_fit_end(self) -> None:
+        return super().on_fit_end()
 
     def validation_step(self, batch, batch_idx):
         inputs, target = batch
         output = self(inputs)
         loss = torch.nn.functional.cross_entropy(output, target.view(-1))
-        self.log("val_loss", loss, on_step=True, on_epoch=True,prog_bar=True, sync_dist=True)
+        self.log("val_loss", loss, on_epoch=True, prog_bar=True, sync_dist=True)
         return loss
+
+    def get_trainable_layers(self):
+        return get_trainable_layers(self)
+
+    def get_activations(self):
+        return get_activations(self)
+
+def forward_hook(module, input, output):
+    module.out = output  # Store output in the module itself
+    module.out.retain_grad()  # Ensure that the output gradients are stored
