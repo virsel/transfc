@@ -14,10 +14,11 @@ from lightning.pytorch.loggers import TensorBoardLogger
 
 
 class Logger(TensorBoardLogger):
-    def __init__(self, model, *args, **kwargs):
-        super().__init__(".", name="lightning_logs", *args, **kwargs)
+    def __init__(self, model, version="v1", *args, **kwargs):
+        super().__init__(".", name=f"lightning_logs/{version}", *args, **kwargs)
         self._log_graph = True
         self.model = model
+        self.model.set_custom_logger(self)
         self.experiment.add_custom_scalars(self._layout())
 
     def _layout(self):
@@ -38,7 +39,7 @@ class Logger(TensorBoardLogger):
 
         layout = {
             "Layer Metrics": {
-                "Activation Out": ["Multiline", activation_params],
+                "Activation Out Saturation": ["Multiline", activation_params],
                 "Update Discrepancy by Layer": ["Multiline", discrepancy_params]
             }
         }
@@ -63,17 +64,39 @@ class Logger(TensorBoardLogger):
                 # Log the metric using the formatted name
                 self.model.log(formatted_name, metric, on_step=False, on_epoch=True, sync_dist=True)
 
-    def log_activation_out(self):
+    def log_activation_out_sat(self):
         for i, item in enumerate(self.model.get_activations().items()):
             name, layer = item
-            # if isinstance(layer, (nn.ReLU, nn.Sigmoid, nn.Tanh)):
-            #     t = layer.out  # Make sure outputs are stored during forward pass
-            #     self.log(f'act_{name}_out', t.mean().item(), on_step=False, on_epoch=True)
             if isinstance(layer, nn.ReLU):
-                t = layer.out  # Make sure outputs are stored during forward pass
+                t = layer.out.detach()  # Make sure outputs are stored during forward pass
                 saturation = (t < 0.05).float().mean() * 100
                 self.model.log(f'z_act_{name.replace(".", "_")}_out_sat', saturation, on_step=False, on_epoch=True, sync_dist=True)
             if isinstance(layer, nn.Tanh):
-                t = layer.out  # Make sure outputs are stored during forward pass
+                t = layer.out.detach()  # Make sure outputs are stored during forward pass
                 saturation = (t.abs() > 0.025).float().mean() * 100
                 self.model.log(f'z_act_{name.replace(".", "_")}_out_sat', saturation, on_step=False, on_epoch=True, sync_dist=True)
+
+    def log_out_on_epoch(self):
+        for i, item in enumerate(self.model.get_activations().items()):
+            name, layer = item
+            self.experiment.add_histogram(f'z_act_{name.replace(".", "_")}_out_grad', layer.out.grad, self.model.global_step)
+            t = layer.out.detach()
+            self.experiment.add_histogram(f'z_act_{name.replace(".", "_")}_out', t, self.model.global_step)
+        for i, item in enumerate(self.model.get_trainable_layers().items()):
+            name, layer = item
+            self.experiment.add_histogram(f'z_{name.replace(".", "_")}_out_grad', layer.out.grad,
+                                          self.model.global_step)
+            t = layer.out.detach()
+            self.experiment.add_histogram(f'z_{name.replace(".", "_")}_out', t, self.model.global_step)
+
+    def log_model_arch(self):
+        # Log the model architecture at the start of training
+        model_info = "<br>".join([f"{name}: {str(el)}" for name, el in self.model.get_elements().items()])
+        self.experiment.add_text('Model Architecture', model_info, 0)
+
+    def log_params(self):
+        # Log hyperparameters as text
+        hp_text = "<br>".join([f"{key}: {value}" for key, value in vars(self.model.params).items()])
+        self.experiment.add_text('Hyperparameters', hp_text, 0)
+
+

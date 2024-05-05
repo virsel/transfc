@@ -1,3 +1,7 @@
+from collections import OrderedDict
+
+from custom_logging import Logger
+
 import lightning as L
 
 import torch.nn as nn
@@ -46,6 +50,24 @@ def get_activations(parent_module, parent_name='root'):
             res.update(sub_layers)
     return res
 
+def get_elements(parent_module, parent_name='root'):
+    res = {}
+    modules = list(parent_module.named_children())
+    if len(modules) == 0:
+        # Base case: If no children and has trainable params, return itself
+        res[parent_name] = parent_module
+    else:
+        for name, module in modules:
+            # Construct the full module name by appending current name to parent's
+            full_name = f'{parent_name}.{name}' if parent_name else name
+            # Recursively get trainable layers
+            sub_layers = get_elements(module, full_name)
+            if len(sub_layers) == 0:
+                # If the module has parameters but no sub-layers returned, add the module
+                res[full_name] = module
+            res.update(sub_layers)
+    return res
+
 class Head(nn.Module):
     """ one head of self-attention """
 
@@ -54,7 +76,7 @@ class Head(nn.Module):
         self.key = nn.Linear(params.n_embd, params.n_embd // params.n_head, bias=False)
         self.query = nn.Linear(params.n_embd, params.n_embd // params.n_head, bias=False)
         self.value = nn.Linear(params.n_embd, params.n_embd // params.n_head, bias=False)
-        self.register_buffer('tril', torch.tril(torch.ones(params.context_length, params.context_length)))
+        # self.register_buffer('tril', torch.tril(torch.ones(params.context_length, params.context_length)))
         self.dropout = nn.Dropout(params.dropout)
 
     def forward(self, x):
@@ -63,7 +85,7 @@ class Head(nn.Module):
         q = self.query(x)  # (B,T,C)
         # compute attention scores ("affinities")
         wei = q @ k.transpose(-2, -1) * C ** -0.5  # (B, T, C) @ (B, C, T) -> (B, T, T)
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))  # (B, T, T)
+        # wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))  # (B, T, T)
         wei = F.softmax(wei, dim=-1)  # (B, T, T)
         wei = self.dropout(wei)
         # perform the weighted aggregation of the values
@@ -90,12 +112,12 @@ class FeedFoward(nn.Module):
 
     def __init__(self, n_embd, dropout=0.1):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd),
-            nn.ReLU(),
-            nn.Linear(4 * n_embd, n_embd),
-            nn.Dropout(dropout),
-        )
+        self.net = nn.Sequential(OrderedDict([
+            ('ln1', nn.Linear(n_embd, 4 * n_embd)),
+            ('relu1', nn.ReLU()),
+            ('ln2', nn.Linear(4 * n_embd, n_embd)),
+            ('dropout2', nn.Dropout(dropout))
+        ]))
 
     def forward(self, x):
         return self.net(x)
@@ -106,10 +128,10 @@ class Block(nn.Module):
     def __init__(self, params: HyperParams):
         # n_embd: embedding dimension, n_head: the number of heads we'd like
         super().__init__()
-        self.sa = MultiHeadAttention(params)
-        self.ffwd = FeedFoward(params.n_embd)
         self.ln1 = nn.LayerNorm(params.n_embd)
+        self.sa = MultiHeadAttention(params)
         self.ln2 = nn.LayerNorm(params.n_embd)
+        self.ffwd = FeedFoward(params.n_embd)
 
     def forward(self, x):
         x = x + self.sa(self.ln1(x))
@@ -122,6 +144,8 @@ class TransfEncModel(L.LightningModule):
         # Important: This property activates manual optimization.
         self.automatic_optimization = False
         self.lossi = []
+        self.custom_logger: Logger = None
+        self.params = params
 
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(params.vocab_size, params.n_embd)
@@ -138,6 +162,11 @@ class TransfEncModel(L.LightningModule):
         activations = self.get_activations().values()
         for act in activations:
             act.register_forward_hook(forward_hook)
+        for l in self.get_trainable_layers().values():
+            l.register_forward_hook(forward_hook)
+
+    def set_custom_logger(self, logger: Logger):
+        self.custom_logger = logger
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=0.001, weight_decay=0.01)
@@ -157,6 +186,10 @@ class TransfEncModel(L.LightningModule):
 
         return logits
 
+    def on_train_start(self) -> None:
+        self.custom_logger.log_model_arch()
+        self.custom_logger.log_params()
+
     def training_step(self, batch, batch_idx):
         inputs, target = batch
         opt = self.optimizers()
@@ -173,11 +206,14 @@ class TransfEncModel(L.LightningModule):
         )
         return loss
 
+    def on_train_epoch_end(self) -> None:
+        if self.custom_logger:
+            self.custom_logger.log_out_on_epoch()
+
     def training_step_log(self):
-        if hasattr(self.logger, 'log_ud'):
-            self.logger.log_ud()
-        if hasattr(self.logger, 'log_activation_out'):
-            self.logger.log_activation_out()
+        if self.custom_logger:
+            self.custom_logger.log_ud()
+            self.custom_logger.log_activation_out_sat()
 
     def on_fit_end(self) -> None:
         return super().on_fit_end()
@@ -195,6 +231,10 @@ class TransfEncModel(L.LightningModule):
     def get_activations(self):
         return get_activations(self)
 
+    def get_elements(self):
+        return get_elements(self)
+
 def forward_hook(module, input, output):
-    module.out = output  # Store output in the module itself
-    module.out.retain_grad()  # Ensure that the output gradients are stored
+    if module.training:
+        module.out = output # Store output in the module itself
+        module.out.retain_grad()  # Ensure that the output gradients are stored
