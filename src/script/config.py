@@ -11,13 +11,14 @@ class HyperParams:
         self.context_length = 32
         self.dropout = 0.1
         self.n_head = 1
+        self.lr = 0.001
 
 
 @dataclass
 class Config:
     hyper_params = HyperParams()
     n_workers = 4
-    model_version = "v1"
+    model_version = "v2"
     # /path/to/save/checkpoints
     ckpt_path = None
     checkpoint_dir: Path = Path(f"../output/checkpoints/{model_version}").absolute()

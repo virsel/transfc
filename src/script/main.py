@@ -51,6 +51,7 @@ if __name__ == '__main__':
     val_loader = DataLoader(val_dataset, batch_size=cfg.hyper_params.batch_size, shuffle=False, num_workers=2, persistent_workers=True)
     
     model = get_model(cfg.hyper_params)
+    model.set_val_data_loader(val_loader)
     logger = Logger(model, cfg.model_version)
 
     # train with pytorch lightning

@@ -1,5 +1,3 @@
-from collections import OrderedDict
-
 from custom_logging import Logger
 
 import lightning as L
@@ -8,7 +6,8 @@ import torch.nn as nn
 import torch
 import torch.nn.functional as F
 
-from config import Config, HyperParams
+from config import HyperParams
+from src.script.utils import act_possible
 
 
 def get_model(params: HyperParams):
@@ -35,7 +34,7 @@ def get_trainable_layers(parent_module, parent_name='root'):
 def get_activations(parent_module, parent_name='root'):
     res = {}
     modules = list(parent_module.named_children())
-    if len(modules) == 0 and isinstance(parent_module, (nn.ReLU, nn.Sigmoid, nn.Tanh)):
+    if len(modules) == 0 and isinstance(parent_module, act_possible):
         # Base case: If no children and has trainable params, return itself
         res[parent_name] = parent_module
     else:
@@ -44,7 +43,7 @@ def get_activations(parent_module, parent_name='root'):
             full_name = f'{parent_name}.{name}' if parent_name else name
             # Recursively get trainable layers
             sub_layers = get_activations(module, full_name)
-            if len(sub_layers) == 0 and isinstance(module, (nn.ReLU, nn.Sigmoid, nn.Tanh)):
+            if len(sub_layers) == 0 and isinstance(module, act_possible):
                 # If the module has parameters but no sub-layers returned, add the module
                 res[full_name] = module
             res.update(sub_layers)
@@ -109,18 +108,21 @@ class MultiHeadAttention(nn.Module):
 
 class FeedFoward(nn.Module):
     """ a simple linear layer followed by a non-linearity """
-
     def __init__(self, n_embd, dropout=0.1):
         super().__init__()
-        self.net = nn.Sequential(OrderedDict([
-            ('ln1', nn.Linear(n_embd, 4 * n_embd)),
-            ('relu1', nn.ReLU()),
-            ('ln2', nn.Linear(4 * n_embd, n_embd)),
-            ('dropout2', nn.Dropout(dropout))
-        ]))
+        # Define individual layers
+        self.l1 = nn.Linear(n_embd, 4 * n_embd)
+        self.elu1 = nn.ELU()
+        self.l2 = nn.Linear(4 * n_embd, n_embd)
+        self.dropout2 = nn.Dropout(dropout)
 
     def forward(self, x):
-        return self.net(x)
+        # Manually apply each layer
+        x = self.l1(x)
+        x = self.elu1(x)
+        x = self.l2(x)
+        x = self.dropout2(x)
+        return x
 
 class Block(nn.Module):
     """ Transformer block: communication followed by computation """
@@ -169,7 +171,7 @@ class TransfEncModel(L.LightningModule):
         self.custom_logger = logger
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=0.001, weight_decay=0.01)
+        return torch.optim.AdamW(self.parameters(), lr=self.params.lr, weight_decay=0.01)
 
     def forward(self, idx):
         B, T = idx.shape
@@ -186,9 +188,29 @@ class TransfEncModel(L.LightningModule):
 
         return logits
 
+    def set_val_data_loader(self, val_dataloader):
+        self.val_dataloader = val_dataloader
+
     def on_train_start(self) -> None:
         self.custom_logger.log_model_arch()
         self.custom_logger.log_params()
+        # Compute validation loss before any weights are updated
+        if self.val_dataloader:
+            val_loss = self.compute_val_loss()  # You need to implement this method
+            self.logger.experiment.add_scalar("val_loss", val_loss, self.global_step)
+
+    def compute_val_loss(self):
+        # Function to compute validation loss before any weights are updated
+        val_loss = 0.0
+        num_batches = 0
+        for batch in self.val_dataloader:
+            inputs, target = batch
+            output = self(inputs)
+            loss = torch.nn.functional.cross_entropy(output, target.view(-1))
+            val_loss += loss.item()
+            num_batches += 1
+        val_loss /= num_batches
+        return val_loss
 
     def training_step(self, batch, batch_idx):
         inputs, target = batch
