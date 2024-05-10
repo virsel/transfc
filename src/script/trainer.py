@@ -21,6 +21,6 @@ def get_trainer(cfg: Config, logger=None):
         strategy="ddp_spawn",
         devices=cfg.n_workers,
         # Other trainer arguments
-        max_epochs=4,
+        max_epochs=25,
         logger=logger
     )

@@ -79,7 +79,7 @@ class Logger(TensorBoardLogger):
                 self.model.log(f'z_act_{name.replace(".", "_")}_out_sat', saturation, on_step=False, on_epoch=True, sync_dist=True)
             elif isinstance(layer, nn.ELU):
                 t = layer.out.detach()  # Make sure outputs are stored during forward pass
-                saturation = (t < -3).float().mean() * 100
+                saturation = (t < 0).float().mean() * 100
                 self.model.log(f'z_act_{name.replace(".", "_")}_out_sat', saturation, on_step=False, on_epoch=True, sync_dist=True)
 
     def log_out_on_epoch(self):

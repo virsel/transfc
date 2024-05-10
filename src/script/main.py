@@ -31,8 +31,8 @@ random.seed(seed_value)
 
 
 def get_data():
-    data_path = '../../data_input/train.csv'
-    return pd.read_csv(data_path, usecols=['id', 'text', 'label'])
+    data_path = '../../data_input/train2.csv'
+    return pd.read_csv(data_path, usecols=['id', 'text4', 'label'])
 
 if __name__ == '__main__':
     os.environ["MASTER_ADDR"] = "localhost"
@@ -41,7 +41,7 @@ if __name__ == '__main__':
 
     df = get_data()
     Xtr, Xval, Ytr, Yval = get_train_test_split(
-        df["text"], df["label"], context_length=cfg.hyper_params.context_length, test_size=0.2, random_state=seed_value
+        df["text4"], df["label"], context_length=cfg.hyper_params.context_length, test_size=0.2, random_state=seed_value
     )
 
     train_dataset = TensorDataset(Xtr, Ytr)

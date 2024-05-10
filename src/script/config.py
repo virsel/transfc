@@ -6,19 +6,20 @@ class HyperParams:
     def __init__(self):
         self.vocab_size = 5001
         self.n_embd = 16
-        self.n_hidden = 64
-        self.batch_size = 32
-        self.context_length = 32
+        self.n_hidden = 32
+        self.batch_size = 16
+        self.context_length = 40
         self.dropout = 0.1
-        self.n_head = 1
-        self.lr = 0.001
+        self.n_head = 2
+        self.n_blocks = 1
+        self.lr = 0.01
 
 
 @dataclass
 class Config:
     hyper_params = HyperParams()
-    n_workers = 4
-    model_version = "v2"
+    n_workers = 6
+    model_version = "v8"
     # /path/to/save/checkpoints
     ckpt_path = None
     checkpoint_dir: Path = Path(f"../output/checkpoints/{model_version}").absolute()

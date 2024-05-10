@@ -1,3 +1,5 @@
+import math
+
 from custom_logging import Logger
 
 import lightning as L
@@ -77,6 +79,13 @@ class Head(nn.Module):
         self.value = nn.Linear(params.n_embd, params.n_embd // params.n_head, bias=False)
         # self.register_buffer('tril', torch.tril(torch.ones(params.context_length, params.context_length)))
         self.dropout = nn.Dropout(params.dropout)
+    #     self._initialize_weights()
+    #
+    # def _initialize_weights(self):
+    #     # Using Glorot uniform initialization
+    #     nn.init.xavier_uniform_(self.query, gain=nn. init. calculate_gain('relu'))
+    #     nn.init.xavier_uniform_(self.key, gain=nn. init. calculate_gain('relu'))
+    #     nn.init.xavier_uniform_(self.value, gain=nn. init. calculate_gain('relu'))
 
     def forward(self, x):
         B, T, C = x.shape
@@ -108,20 +117,26 @@ class MultiHeadAttention(nn.Module):
 
 class FeedFoward(nn.Module):
     """ a simple linear layer followed by a non-linearity """
-    def __init__(self, n_embd, dropout=0.1):
+    def __init__(self, params: HyperParams):
         super().__init__()
         # Define individual layers
-        self.l1 = nn.Linear(n_embd, 4 * n_embd)
+        self.l1 = nn.Linear(params.n_embd, params.n_hidden)
+        self.batchnorm1 = nn.BatchNorm1d(params.context_length)
         self.elu1 = nn.ELU()
-        self.l2 = nn.Linear(4 * n_embd, n_embd)
-        self.dropout2 = nn.Dropout(dropout)
+        self.dropout1 = nn.Dropout(params.dropout)
+        self.l2 = nn.Linear(params.n_hidden, params.n_embd)
+        self.batchnorm2 = nn.BatchNorm1d(params.context_length)
+        self.elu2 = nn.ELU()
 
     def forward(self, x):
         # Manually apply each layer
         x = self.l1(x)
+        x = self.dropout1(x)
+        x = self.batchnorm1(x)
         x = self.elu1(x)
         x = self.l2(x)
-        x = self.dropout2(x)
+        x = self.batchnorm2(x)
+        x = self.elu2(x)
         return x
 
 class Block(nn.Module):
@@ -130,14 +145,25 @@ class Block(nn.Module):
     def __init__(self, params: HyperParams):
         # n_embd: embedding dimension, n_head: the number of heads we'd like
         super().__init__()
-        self.ln1 = nn.LayerNorm(params.n_embd)
+        self.lnorm1 = nn.LayerNorm(params.n_embd)
+        self.dropout1 = nn.Dropout(p=params.dropout)
         self.sa = MultiHeadAttention(params)
-        self.ln2 = nn.LayerNorm(params.n_embd)
-        self.ffwd = FeedFoward(params.n_embd)
+        self.lnorm2 = nn.LayerNorm(params.n_embd)
+        self.ffwd = FeedFoward(params)
+        self.dropout2 = nn.Dropout(p=params.dropout)
 
     def forward(self, x):
-        x = x + self.sa(self.ln1(x))
-        x = x + self.ffwd(self.ln2(x))
+        # self-attention
+        _x = x
+        x = self.sa(x)
+        x = self.dropout1(x)
+        x = self.lnorm1(_x + x)
+
+        # feedforward
+        _x = x
+        x = self.ffwd(x)
+        x = self.dropout2(x)
+        x = self.lnorm2(_x + x)
         return x
 
 class TransfEncModel(L.LightningModule):
@@ -151,10 +177,15 @@ class TransfEncModel(L.LightningModule):
 
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(params.vocab_size, params.n_embd)
-        self.position_embedding_table = nn.Embedding(params.context_length, params.n_embd)
-        self.blocks = nn.Sequential(*[Block(params) for _ in range(1)])
-        self.ln_f = nn.LayerNorm(params.n_embd)  # final layer norm
-        self.lm_head = nn.Linear(params.context_length * params.n_embd, n_classes)
+        self.token_embedding_table.weight = nn.Parameter(self.token_embedding_table.weight // (params.n_embd ** 0.5), requires_grad=True)
+
+        # Create sinusoidal positional embedding
+        self.position_embedding_table = self.create_sinusoidal_positional_embedding(params.context_length, params.n_embd)
+
+        self.blocks = nn.Sequential(*[Block(params) for _ in range(self.params.n_blocks)])
+        self.lnorm_f = nn.LayerNorm(params.n_embd)  # final layer norm
+        self.l_out = nn.Linear(params.n_embd, n_classes)
+        self.l_out.weight = nn.Parameter(self.l_out.weight * 0.1, requires_grad=True)
 
         # register forward hook
         self._register_forward_hooks()
@@ -167,6 +198,16 @@ class TransfEncModel(L.LightningModule):
         for l in self.get_trainable_layers().values():
             l.register_forward_hook(forward_hook)
 
+    def create_sinusoidal_positional_embedding(self, max_seq_len, embedding_dim):
+        """Create sinusoidal positional embedding matrix as per Vaswani et al."""
+        position = torch.arange(0, max_seq_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, embedding_dim, 2).float() * (-math.log(10000.0) / embedding_dim))
+        pos_embedding = torch.zeros(max_seq_len, embedding_dim)
+        pos_embedding[:, 0::2] = torch.sin(position * div_term)
+        pos_embedding[:, 1::2] = torch.cos(position * div_term)
+        pos_embedding = pos_embedding.unsqueeze(0)  # Shape (1, max_seq_len, embedding_dim)
+        return nn.Parameter(pos_embedding, requires_grad=False)
+
     def set_custom_logger(self, logger: Logger):
         self.custom_logger = logger
 
@@ -178,13 +219,14 @@ class TransfEncModel(L.LightningModule):
 
         # idx and targets are both (B,T) tensor of integers
         tok_emb = self.token_embedding_table(idx)  # (B,T,C)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=self.device))  # (T,C)
+        pos_emb = self.position_embedding_table[:, :T, :]  # (1, T, C)
         x = tok_emb + pos_emb  # (B,T,C)
         x = self.blocks(x)  # (B,T,C)
-        x = self.ln_f(x)  # (B,T,C)
-        B, T, C = x.shape
-        x = x.view(B, T * C)  # (B,T,C) -> (B, T*C)
-        logits = self.lm_head(x)  # (B,n_classes)
+        x = self.lnorm_f(x)  # (B,T,C)
+        # B, T, C = x.shape
+        # x = x.view(B, T * C)  # (B,T,C) -> (B, T*C)
+        logits = self.l_out(x)  # (B,n_classes)
+        logits = logits[:, -1, :]  # becomes (B, C)
 
         return logits
 
