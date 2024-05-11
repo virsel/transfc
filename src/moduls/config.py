@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
 
-
 class HyperParams:
     def __init__(self):
         self.vocab_size = 5001
@@ -14,16 +13,16 @@ class HyperParams:
         self.n_blocks = 1
         self.lr = 0.01
 
-
 @dataclass
 class Config:
     hyper_params = HyperParams()
     n_workers = 6
-    model_version = "v8"
+    model_version = "v1"
+    feature_label = "feature_vec"
+    target_label = "label"
     # /path/to/save/checkpoints
     ckpt_path = None
     checkpoint_dir: Path = Path(f"../output/checkpoints/{model_version}").absolute()
-
 
 def get_default_config() -> Config:
     cfg = Config()

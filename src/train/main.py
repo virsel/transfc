@@ -1,17 +1,17 @@
 
-from model import get_model
 from torch.utils.data import DataLoader, TensorDataset
 import pandas as pd
 from data import get_train_test_split
-from config import get_default_config
-import lightning as L
-from custom_logging import set_logging, Logger
+from src.moduls.config import get_default_config
+
+from src.moduls.custom_logging import set_logging, Logger
+from src.moduls.model import get_model
 
 set_logging()
 import torch
 import numpy as np
 import random
-from trainer import get_trainer
+from src.moduls.trainer import get_trainer
 import os
 
 
@@ -31,8 +31,8 @@ random.seed(seed_value)
 
 
 def get_data():
-    data_path = '../../data_input/train2.csv'
-    return pd.read_csv(data_path, usecols=['id', 'text4', 'label'])
+    data_path = '../../data_input/4_feature_vec.csv'
+    return pd.read_csv(data_path, usecols=['id', 'feature_vec', 'label'])
 
 if __name__ == '__main__':
     os.environ["MASTER_ADDR"] = "localhost"
@@ -41,8 +41,10 @@ if __name__ == '__main__':
 
     df = get_data()
     Xtr, Xval, Ytr, Yval = get_train_test_split(
-        df["text4"], df["label"], context_length=cfg.hyper_params.context_length, test_size=0.2, random_state=seed_value
+        df["feature_vec"], df["label"], test_size=0.2, random_state=seed_value
     )
+
+    cfg.hyper_params.context_length = Xtr.shape[1]
 
     train_dataset = TensorDataset(Xtr, Ytr)
     val_dataset = TensorDataset(Xval, Yval)
@@ -58,7 +60,5 @@ if __name__ == '__main__':
     trainer = get_trainer(cfg, logger=logger)
     trainer.fit(model, train_loader, val_loader, ckpt_path=cfg.ckpt_path)
 
-    # save the model
-    # torch.save(model.state_dict(), "../output/model.pth")
 
 

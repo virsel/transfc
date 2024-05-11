@@ -1,15 +1,17 @@
 import math
 
-from custom_logging import Logger
+from .custom_logging import Logger
 
 import lightning as L
 
 import torch.nn as nn
 import torch
 import torch.nn.functional as F
+from sklearn.metrics import classification_report
 
-from config import HyperParams
-from src.script.utils import act_possible
+from .config import HyperParams
+from .utils import act_possible
+import torchmetrics
 
 
 def get_model(params: HyperParams):
@@ -169,6 +171,7 @@ class Block(nn.Module):
 class TransfEncModel(L.LightningModule):
     def __init__(self, params: HyperParams, n_classes=5):
         super().__init__()
+        self.save_hyperparameters()
         # Important: This property activates manual optimization.
         self.automatic_optimization = False
         self.lossi = []
@@ -190,6 +193,13 @@ class TransfEncModel(L.LightningModule):
         # register forward hook
         self._register_forward_hooks()
 
+        # Metrics
+        self.accuracy = torchmetrics.Accuracy(task="multiclass", num_classes=n_classes)
+        self.precision = torchmetrics.Precision(task="multiclass", num_classes=n_classes, average='macro')
+        self.recall = torchmetrics.Recall(task="multiclass", num_classes=n_classes, average='macro')
+        self.predictions = []
+        self.labels = []
+
     def _register_forward_hooks(self):
         # Define the forward hook function
         activations = self.get_activations().values()
@@ -198,15 +208,25 @@ class TransfEncModel(L.LightningModule):
         for l in self.get_trainable_layers().values():
             l.register_forward_hook(forward_hook)
 
-    def create_sinusoidal_positional_embedding(self, max_seq_len, embedding_dim):
+    def create_sinusoidal_positional_embedding(self, seq_len, embd, n = 10000):
         """Create sinusoidal positional embedding matrix as per Vaswani et al."""
-        position = torch.arange(0, max_seq_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, embedding_dim, 2).float() * (-math.log(10000.0) / embedding_dim))
-        pos_embedding = torch.zeros(max_seq_len, embedding_dim)
-        pos_embedding[:, 0::2] = torch.sin(position * div_term)
-        pos_embedding[:, 1::2] = torch.cos(position * div_term)
-        pos_embedding = pos_embedding.unsqueeze(0)  # Shape (1, max_seq_len, embedding_dim)
-        return nn.Parameter(pos_embedding, requires_grad=False)
+
+        if embd % 2 != 0:
+            raise ValueError(
+                "Sinusoidal positional embedding cannot apply to odd token embedding dim (got dim={:d})".format(
+                    embd))
+
+        T = seq_len
+        d = embd  # d_model=head_num*d_k, not d_q, d_k, d_v
+
+        positions = torch.arange(0, T).unsqueeze_(1)
+        embeddings = torch.zeros(T, d)
+
+        denominators = torch.pow(n, 2 * torch.arange(0, d // 2) / d)  # 10000^(2i/d_model), i is the index of embedding
+        embeddings[:, 0::2] = torch.sin(positions / denominators)  # sin(pos/10000^(2i/d_model))
+        embeddings[:, 1::2] = torch.cos(positions / denominators)  # cos(pos/10000^(2i/d_model))
+
+        return nn.Parameter(embeddings, requires_grad=False)
 
     def set_custom_logger(self, logger: Logger):
         self.custom_logger = logger
@@ -219,7 +239,7 @@ class TransfEncModel(L.LightningModule):
 
         # idx and targets are both (B,T) tensor of integers
         tok_emb = self.token_embedding_table(idx)  # (B,T,C)
-        pos_emb = self.position_embedding_table[:, :T, :]  # (1, T, C)
+        pos_emb = self.position_embedding_table  # (1, T, C)
         x = tok_emb + pos_emb  # (B,T,C)
         x = self.blocks(x)  # (B,T,C)
         x = self.lnorm_f(x)  # (B,T,C)
@@ -270,6 +290,8 @@ class TransfEncModel(L.LightningModule):
         )
         return loss
 
+
+
     def on_train_epoch_end(self) -> None:
         if self.custom_logger:
             self.custom_logger.log_out_on_epoch()
@@ -288,6 +310,33 @@ class TransfEncModel(L.LightningModule):
         loss = torch.nn.functional.cross_entropy(output, target.view(-1))
         self.log("val_loss", loss, on_epoch=True, prog_bar=True, sync_dist=True)
         return loss
+
+    def test_step(self, batch, batch_idx):
+        x, y = batch
+        logits = self(x)
+        preds = torch.argmax(logits, dim=1)
+        self.predictions.extend(preds.cpu().numpy())
+        self.labels.extend(y.cpu().numpy())
+
+        # Update metrics
+        self.accuracy.update(preds, y)
+        self.precision.update(preds, y)
+        self.recall.update(preds, y)
+        return {'test_loss': F.cross_entropy(logits, y)}
+
+    def on_test_epoch_end(self):
+        # Log metrics to TensorBoard
+        self.log('test_accuracy', self.accuracy.compute(), on_epoch=True)
+        self.log('test_precision', self.precision.compute(), on_epoch=True)
+        self.log('test_recall', self.recall.compute(), on_epoch=True)
+
+        # Classification report
+        report = classification_report(self.labels, self.predictions, output_dict=True)
+        for label, metrics in report.items():
+            if isinstance(metrics, dict):  # Skip the summary metrics
+                for metric_name, score in metrics.items():
+                    self.log(f'test_{label}_{metric_name}', score)
+
 
     def get_trainable_layers(self):
         return get_trainable_layers(self)

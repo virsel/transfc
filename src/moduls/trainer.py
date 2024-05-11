@@ -1,7 +1,7 @@
 from lightning import Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint
 
-from config import Config
+from .config import Config
 
 
 def get_trainer(cfg: Config, logger=None):

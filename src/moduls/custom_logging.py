@@ -2,7 +2,7 @@ import os
 import logging
 from torch import nn
 
-from utils import act_possible
+from .utils import act_possible
 
 
 def set_logging():
